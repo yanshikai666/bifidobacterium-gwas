@@ -1,0 +1,59 @@
+#!/bin/bash
+###############1质控
+# define file pathsrefgenome="/mnt/d/bifi/refgene/ATCC_29521.fasta"
+rawdirlong="/mnt/d/long/rawfastq"
+rawdirbifi="/mnt/d/bifi/rawfastq"
+qcdir="/mnt/d/gwas/bl/cleanfastq"
+refgenome="/mnt/d/gwas/bl/cleanfastq/refegene/ATCC_29521.fasta"
+
+
+#mkae dir
+mkdir -p $qcdir
+mkdir -p $qcdir/html
+mkdir -p $qcdir/json
+mkdir -p $qcdir/failed
+
+ conda activate snpcall
+# loop over raw fastq files for rawdirlong and perform quality control with fastp
+for file1 in $rawdirlong/*_R1.fastq.gz; do
+    file2=${file1/_R1.fastq.gz/_R2.fastq.gz}
+    base=$(basename "$file1" _R1.fastq.gz)
+    name="${base%.fastq.gz}"
+    dir=$(dirname "$file1")
+
+    # fastp
+    fastp -i "$file1" -I "$file2" \
+        -o "$qcdir/${name}_R1.clean.fastq.gz" \
+        -O "$qcdir/${name}_R2.clean.fastq.gz" \
+        -h "$qcdir/html/${name}_clean.html" \
+        -j "$qcdir/json/${name}_clean.json" \
+        --overlap_len_require 6 \
+        --overlap_diff_percent_limit 20 \
+        --detect_adapter_for_pe \
+        -l 20 \
+        -n 5 \
+        -y \
+        
+done
+
+# loop over raw fastq files for rawdirbifi and perform quality control with fastp
+for file1 in $rawdirbifi/*_R1.fastq.gz; do
+    file2=${file1/_R1.fastq.gz/_R2.fastq.gz}
+    base=$(basename "$file1" _R1.fastq.gz)
+    name="${base%.fastq.gz}"
+    dir=$(dirname "$file1")
+
+    # 执行fastp
+    fastp -i "$file1" -I "$file2" \
+        -o "$qcdir/${name}_R1.clean.fastq.gz" \
+        -O "$qcdir/${name}_R2.clean.fastq.gz" \
+        -h "$qcdir/html/${name}_clean.html" \
+        -j "$qcdir/json/${name}_clean.json" \
+        --overlap_len_require 6 \
+        --overlap_diff_percent_limit 20 \
+        --detect_adapter_for_pe \
+        -l 20 \
+        -n 5 \
+        -y \
+        
+done
