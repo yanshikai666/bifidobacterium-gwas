@@ -1,59 +1,85 @@
 #!/bin/bash
-###############1质控
-# define file pathsrefgenome="/mnt/d/bifi/refgene/ATCC_29521.fasta"
+
+# Define file paths and environment variables
+refgenome="/mnt/d/gwas/bl/refegene/ATCC_29521.fasta"
 rawdirlong="/mnt/d/long/rawfastq"
 rawdirbifi="/mnt/d/bifi/rawfastq"
 qcdir="/mnt/d/gwas/bl/cleanfastq"
-refgenome="/mnt/d/gwas/bl/cleanfastq/refegene/ATCC_29521.fasta"
+alignment="/mnt/d/gwas/bl/alignment"
+picard_env="gwas"
+gatk_env="gatk" # Assuming GATK and other tools are in a separate environment
+
+# Create directories
+mkdir -p $qcdir $qcdir/html $qcdir/json $qcdir/failed $alignment/dedup $alignment/gatk
+
+# Function to perform quality control with fastp
+quality_control() {
+    local rawdir=$1
+    for file1 in $rawdir/*_R1.fastq.gz; do
+        file2=${file1/_R1.fastq.gz/_R2.fastq.gz}
+        base=$(basename "$file1" _R1.fastq.gz)
+        name="${base%.fastq.gz}"
+
+        # Execute fastp
+        fastp -i "$file1" -I "$file2" \
+            -o "$qcdir/${name}_R1.clean.fastq.gz" \
+            -O "$qcdir/${name}_R2.clean.fastq.gz" \
+            -h "$qcdir/html/${name}_clean.html" \
+            -j "$qcdir/json/${name}_clean.json" \
+            --overlap_len_require 6 \
+            --overlap_diff_percent_limit 20 \
+            --detect_adapter_for_pe \
+            -l 20 \
+            -n 5 \
+            -y
+    done
+}
+
+# Activate conda environment for SNP calling
+conda activate $picard_env
+
+# Create BWA index and sequence dictionary with Picard
+bwa index $refgenome
+picard CreateSequenceDictionary R=$refgenome O=${refgenome%.fasta}.dict
+
+# Perform quality control for both sets of raw fastq files
+quality_control $rawdirlong
+quality_control $rawdirbifi
+
+# Main loop for alignment, variant calling, and post-processing
+process_samples() {
+    for file1 in $qcdir/*_R1.clean.fastq.gz; do
+        file2=${file1/_R1.clean.fastq.gz/_R2.clean.fastq.gz}
+        base=$(basename "$file1" _R1.clean.fastq.gz)
+        name="${base%_R1*}"
+
+        # BWA alignment and conversion to BAM format, filtering by MAPQ value
+        bwa mem -t 10 -M -Y -R "@RG\tID:$name\tPL:Illumina\tSM:$name" $refgenome $file1 $file2 | \
+        samtools view -bS -q 20 | \
+        samtools sort -o $alignment/$name.q20.sorted.bam -
+
+        # Generate BAM file index
+        samtools index $alignment/$name.q20.sorted.bam
+
+        # Remove PCR duplicates with Picard and index the deduplicated BAM
+        picard MarkDuplicates I=$alignment/$name.q20.sorted.bam O=$alignment/dedup/$name.dedup.bam M=$alignment/dedup/$name.metrics.txt REMOVE_DUPLICATES=true
+        samtools index $alignment/dedup/$name.dedup.bam
+
+        # Variant calling with GATK HaplotypeCaller
+        gatk HaplotypeCaller -R $refgenome -I $alignment/dedup/$name.dedup.bam -O $alignment/gatk/$name.vcf.gz
+    done
+
+    # Index reference genome with samtools
+    samtools faidx $refgenome
+}
+
+# Process samples
+process_samples
+
+# Switch to GATK environment for variant processing
+conda activate $gatk_env
+echo "Pipeline completed successfully."
 
 
-#mkae dir
-mkdir -p $qcdir
-mkdir -p $qcdir/html
-mkdir -p $qcdir/json
-mkdir -p $qcdir/failed
 
- conda activate snpcall
-# loop over raw fastq files for rawdirlong and perform quality control with fastp
-for file1 in $rawdirlong/*_R1.fastq.gz; do
-    file2=${file1/_R1.fastq.gz/_R2.fastq.gz}
-    base=$(basename "$file1" _R1.fastq.gz)
-    name="${base%.fastq.gz}"
-    dir=$(dirname "$file1")
 
-    # fastp
-    fastp -i "$file1" -I "$file2" \
-        -o "$qcdir/${name}_R1.clean.fastq.gz" \
-        -O "$qcdir/${name}_R2.clean.fastq.gz" \
-        -h "$qcdir/html/${name}_clean.html" \
-        -j "$qcdir/json/${name}_clean.json" \
-        --overlap_len_require 6 \
-        --overlap_diff_percent_limit 20 \
-        --detect_adapter_for_pe \
-        -l 20 \
-        -n 5 \
-        -y \
-        
-done
-
-# loop over raw fastq files for rawdirbifi and perform quality control with fastp
-for file1 in $rawdirbifi/*_R1.fastq.gz; do
-    file2=${file1/_R1.fastq.gz/_R2.fastq.gz}
-    base=$(basename "$file1" _R1.fastq.gz)
-    name="${base%.fastq.gz}"
-    dir=$(dirname "$file1")
-
-    # 执行fastp
-    fastp -i "$file1" -I "$file2" \
-        -o "$qcdir/${name}_R1.clean.fastq.gz" \
-        -O "$qcdir/${name}_R2.clean.fastq.gz" \
-        -h "$qcdir/html/${name}_clean.html" \
-        -j "$qcdir/json/${name}_clean.json" \
-        --overlap_len_require 6 \
-        --overlap_diff_percent_limit 20 \
-        --detect_adapter_for_pe \
-        -l 20 \
-        -n 5 \
-        -y \
-        
-done
