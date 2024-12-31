@@ -1,0 +1,137 @@
+#!/bin/bash
+
+# Define file paths
+refgenome="/mnt/d/gwas/bl/refegene/ATCC_29521.fasta"
+qcdir="/mnt/d/gwas/bl/cleanfastq"
+alignment="/mnt/d/gwas/bl/alignment"
+picard_env="gwas"
+
+# Activate conda environment
+conda activate $picard_env
+
+# Create necessary indices and directories
+bwa index $refgenome
+picard CreateSequenceDictionary R=$refgenome O=${refgenome%.fasta}.dict
+samtools faidx $refgenome
+mkdir -p $alignment/{dedup,gatk,gvcf}
+
+# Process each pair of fastq files
+for file1 in $qcdir/*_R1.clean.fastq.gz; do
+    file2=${file1/_R1.clean.fastq.gz/_R2.clean.fastq.gz}
+    base=$(basename "$file1" _R1.clean.fastq.gz)
+    name="${base%_R1*}"
+    
+    # Alignment and BAM processing
+    bwa mem -t 10 -M -Y -R "@RG\tID:$name\tPL:Illumina\tSM:$name" $refgenome $file1 $file2 | \
+        samtools view -bS -q 20 | \
+        samtools sort -o $alignment/$name.q20.sorted.bam -
+    
+    samtools index $alignment/$name.q20.sorted.bam
+    
+    # Remove duplicates and index
+    picard MarkDuplicates \
+        I=$alignment/$name.q20.sorted.bam \
+        O=$alignment/dedup/$name.dedup.bam \
+        M=$alignment/dedup/$name.metrics.txt \
+        REMOVE_DUPLICATES=true
+    
+    samtools index $alignment/dedup/$name.dedup.bam
+    
+    # Variant calling
+    gatk HaplotypeCaller \
+        -R $refgenome \
+        -I $alignment/dedup/$name.dedup.bam \
+        -O $alignment/gatk/$name.vcf.gz
+done
+
+# Joint genotyping
+gatk GenomicsDBImport \
+    -R $refgenome \
+    --genomicsdb-workspace-path my_database \
+    --L AP012323.1 \
+    --variant $alignment/gvcf/*.gvcf.snps.indels.vcf
+
+gatk --java-options "-Xmx4g -Xms4g" GenotypeGVCFs \
+    -R $refgenome \
+    -V gendb://my_database \
+    -O $alignment/gvcf/raw_variantsnew.vcf
+
+# Separate SNPs and INDELs
+for type in SNP INDEL; do
+    gatk SelectVariants \
+        -V $alignment/gvcf/raw_variantsnew.vcf \
+        -select-type $type \
+        -O $alignment/gvcf/raw_variantsnew_${type,,}.vcf.gz
+
+    gatk VariantsToTable \
+        -V $alignment/gvcf/raw_variantsnew_${type,,}.vcf.gz \
+        -F CHROM -F POS -F QD -F QUAL -F SOR -F FS -F MQ -F MQRankSum -F ReadPosRankSum \
+        -O $alignment/gvcf/${type,,}s.recode.table
+done
+
+# Filter SNPs
+gatk VariantFiltration \
+    -V raw_variantsnew_snp.vcf.gz \
+    -filter "QD < 2.0" --filter-name "QD2" \
+    -filter "QUAL < 30.0" --filter-name "QUAL30" \
+    -filter "FS > 60.0" --filter-name "FS60" \
+    -filter "MQ < 40.0" --filter-name "MQ40" \
+    -filter "MQRankSum < -12.5" --filter-name "MQRankSum-12.5" \
+    -filter "ReadPosRankSum < -8.0" --filter-name "ReadPosRankSum-8" \
+    -O snp.hardfiltereannotated.vcf
+
+# Extract PASS variants and keep biallelic sites
+awk '/^#/||$7=="PASS"||$7=="MQRankSum-12.5;ReadPosRankSum-8"||$7=="MQRankSum-12.5"||$7=="ReadPosRankSum-8"' \
+    snp.hardfiltereannotated.vcf | \
+    awk '$5 !~ /([[:alpha:]]|*)+,([[:alpha:]]|*)/{print}' > snp.hardfiltered.biallelic.vcf
+
+# VCFtools filtering with different missing thresholds
+for missing in 0.8 0.5; do
+    vcftools --vcf snp.hardfiltered.biallelic.vcf \
+        --maf 0.05 \
+        --max-missing $missing \
+        --recode --recode-INFO-all \
+        --out snp_hardfiltered_biallelic_maf5_ms${missing/./}
+done
+
+# Process INDELs
+gatk SelectVariants \
+    -V raw_variantsnew_indel.vcf.gz \
+    --O indel.biallelic.vcf \
+    --max-indel-size 9 \
+    --restrict-alleles-to BIALLELIC
+
+gatk VariantFiltration \
+    -V indel.biallelic.vcf \
+    -O indel.biallelic.10bp.hardfilterannotated.vcf \
+    -filter "QD < 2.0" --filter-name "QD2" \
+    -filter "QUAL < 30.0" --filter-name "QUAL30" \
+    -filter "FS > 200.0" --filter-name "FS200" \
+    -filter "ReadPosRankSum < -20.0" --filter-name "ReadPosRankSum-20"
+
+# PLINK analysis pipeline
+plink --vcf snp_hardfiltered_biallelic_maf5_ms50.recode.vcf \
+    --geno 0.5 \
+    --make-bed \
+    --allow-extra-chr \
+    --out filtered_dataset_g
+
+plink --bfile filtered_dataset_g \
+    --mind 0.5 \
+    --make-bed \
+    --allow-extra-chr \
+    --out filtered_dataset_gm
+
+# Quality control analysis
+plink --bfile filtered_dataset_gm \
+    --maf 0.05 \
+    --make-bed \
+    --allow-extra-chr \
+    --out filtered_dataset_gmm
+
+# Population structure analysis
+plink --file test --pca 3 --allow-extra-chr
+
+# GEMMA association analysis
+gemma -bfile test2 -gk 2 -p p.txt
+gemma -bfile test2 -p p.txt -k output/result.sXX.txt -lm 1 -c pca.txt
