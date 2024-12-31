@@ -1,87 +1,75 @@
 #!/bin/bash
 
-# 定义文件路径
+# Define file paths
 refgenome="/mnt/d/gwas/bl/refegene/ATCC_29521.fasta"
 qcdir="/mnt/d/gwas/bl/cleanfastq"
 alignment="/mnt/d/gwas/bl/alignment"
 picard_env="gwas"
 
-# 激活环境
+# Activate conda environment
 conda activate $picard_env
 
-# 创建BWA索引
+# Create necessary indices and directories
 bwa index $refgenome
-
-# Picard创建序列字典
 picard CreateSequenceDictionary R=$refgenome O=${refgenome%.fasta}.dict
+samtools faidx $refgenome
+mkdir -p $alignment/{dedup,gatk,gvcf}
 
-# 创建目录
-mkdir -p $alignment/dedup $alignment/gatk
-
-# 循环处理每对原始fastq文件
+# Process each pair of fastq files
 for file1 in $qcdir/*_R1.clean.fastq.gz; do
     file2=${file1/_R1.clean.fastq.gz/_R2.clean.fastq.gz}
     base=$(basename "$file1" _R1.clean.fastq.gz)
     name="${base%_R1*}"
     
-    # 执行BWA比对，并将比对结果转换为BAM格式，过滤MAPQ值大于等于20的比对记录
-    bwa mem -t 10 -M -Y -R "@RG\tID:$name\tPL:Illumina\tSM:$name" $refgenome $file1 $file2 | samtools view -bS -q 20 | samtools sort -o $alignment/$name.q20.sorted.bam -
+    # Alignment and BAM processing
+    bwa mem -t 10 -M -Y -R "@RG\tID:$name\tPL:Illumina\tSM:$name" $refgenome $file1 $file2 | \
+        samtools view -bS -q 20 | \
+        samtools sort -o $alignment/$name.q20.sorted.bam -
     
-    # 生成BAM文件的索引
     samtools index $alignment/$name.q20.sorted.bam
     
-    # Picard去除PCR重复
-    picard MarkDuplicates I=$alignment/$name.q20.sorted.bam O=$alignment/dedup/$name.dedup.bam M=$alignment/dedup/$name.metrics.txt REMOVE_DUPLICATES=true
+    # Remove duplicates and index
+    picard MarkDuplicates \
+        I=$alignment/$name.q20.sorted.bam \
+        O=$alignment/dedup/$name.dedup.bam \
+        M=$alignment/dedup/$name.metrics.txt \
+        REMOVE_DUPLICATES=true
     
-    # 构建去重后BAM文件的索引
     samtools index $alignment/dedup/$name.dedup.bam
     
-    # GATK变异检测（示例：使用HaplotypeCaller进行单样本SNP和Indel检测）
-    gatk HaplotypeCaller -R $refgenome -I $alignment/dedup/$name.dedup.bam -O $alignment/gatk/$name.vcf.gz
+    # Variant calling
+    gatk HaplotypeCaller \
+        -R $refgenome \
+        -I $alignment/dedup/$name.dedup.bam \
+        -O $alignment/gatk/$name.vcf.gz
 done
 
-# 索引参考基因组
-samtools faidx $refgenome
-
-# 使用GenomicsDBImport合并所有样本的GVCF文件
+# Joint genotyping
 gatk GenomicsDBImport \
--R $refgenome \
---genomicsdb-workspace-path my_database \
---L AP012323.1 \
---variant $alignment/gvcf/*.gvcf.snps.indels.vcf
+    -R $refgenome \
+    --genomicsdb-workspace-path my_database \
+    --L AP012323.1 \
+    --variant $alignment/gvcf/*.gvcf.snps.indels.vcf
 
-# 联合call snp，得到 joint-called SNP&indel
 gatk --java-options "-Xmx4g -Xms4g" GenotypeGVCFs \
--R $refgenome \
--V gendb://my_database \
--O $alignment/gvcf/raw_variantsnew.vcf
+    -R $refgenome \
+    -V gendb://my_database \
+    -O $alignment/gvcf/raw_variantsnew.vcf
 
-# 复制raw_variants.vcf 到 /mnt/d/gwas/bl/gvcfanalysis
-cp $alignment/gvcf/raw_variantsnew.vcf /mnt/d/gwas/bl/gvcfanalysis
+# Separate SNPs and INDELs
+for type in SNP INDEL; do
+    gatk SelectVariants \
+        -V $alignment/gvcf/raw_variantsnew.vcf \
+        -select-type $type \
+        -O $alignment/gvcf/raw_variantsnew_${type,,}.vcf.gz
 
-# 提取SNP和indel
-gatk SelectVariants -V $alignment/gvcf/raw_variantsnew.vcf -select-type SNP -O $alignment/gvcf/raw_variantsnew_snp.vcf.gz
-gatk SelectVariants -V $alignment/gvcf/raw_variantsnew.vcf -select-type INDEL -O $alignment/gvcf/raw_variantsnew_indel.vcf.gz
+    gatk VariantsToTable \
+        -V $alignment/gvcf/raw_variantsnew_${type,,}.vcf.gz \
+        -F CHROM -F POS -F QD -F QUAL -F SOR -F FS -F MQ -F MQRankSum -F ReadPosRankSum \
+        -O $alignment/gvcf/${type,,}s.recode.table
+done
 
-# 使用gatk的VariantsToTable功能提取过滤参数信息
-gatk VariantsToTable -V $alignment/gvcf/raw_variantsnew_snp.vcf.gz -F CHROM -F POS -F QD -F QUAL -F SOR -F FS -F MQ -F MQRankSum -F ReadPosRankSum -O $alignment/gvcf/snps.recode.table
-gatk VariantsToTable -V $alignment/gvcf/raw_variantsnew_indel.vcf.gz -F CHROM -F POS -F QD -F QUAL -F SOR -F FS -F MQ -F MQRankSum -F ReadPosRankSum -O $alignment/gvcf/indel.recode.table
-
-#5、使用gatk的variantstotable功能提取过滤参数信息
-gatk VariantsToTable -V raw_variantsnew_snp.vcf.gz -F CHROM -F POS -F QD -F QUAL -F SOR -F FS -F MQ -F MQRankSum -F ReadPosRankSum -O snps.recode.table
-
-gatk VariantsToTable -V raw_variantsnew_indel.vcf.gz -F CHROM -F POS -F QD -F QUAL -F SOR -F FS -F MQ -F MQRankSum -F ReadPosRankSum -O indel.recode.table 
-
-# 6、 使用gatk VariantFiltration 过滤 SNP，过滤参数解释https://zhuanlan.zhihu.com/p/34878471
-##FILTER=<ID=Filter,Description="QD < 2.0 || MQ < 40.0 || FS > 60.0 || SOR > 3.0 || QUAL < 30 || DP < 120">
-
-
-
-# gz格式需要用tabix索引，文章中的结果
-gatk=gatk
-vcf=snp.vcf.gz
-out_prefix=snp.hardfiltereannotated
-
+# Filter SNPs
 gatk VariantFiltration \
     -V raw_variantsnew_snp.vcf.gz \
     -filter "QD < 2.0" --filter-name "QD2" \
@@ -92,157 +80,58 @@ gatk VariantFiltration \
     -filter "ReadPosRankSum < -8.0" --filter-name "ReadPosRankSum-8" \
     -O snp.hardfiltereannotated.vcf
 
- #提取通过过滤的变异（PASS），对于没有注释 MQRankSum 和ReadPosRankSum的位点也保留下来
-awk '/^#/||$7=="PASS"||$7=="MQRankSum-12.5;ReadPosRankSum-8"||$7=="MQRankSum-12.5"||$7=="ReadPosRankSum-8"' snp.hardfiltereannotated.vcf > snp.hardfiltered.vcf 
+# Extract PASS variants and keep biallelic sites
+awk '/^#/||$7=="PASS"||$7=="MQRankSum-12.5;ReadPosRankSum-8"||$7=="MQRankSum-12.5"||$7=="ReadPosRankSum-8"' \
+    snp.hardfiltereannotated.vcf | \
+    awk '$5 !~ /([[:alpha:]]|*)+,([[:alpha:]]|*)/{print}' > snp.hardfiltered.biallelic.vcf
 
-# 剔除非2个等位基因的位点。对于二倍体物种可以仅保留双等位基因位点。细菌属于单倍体物种，是否要考虑添加两种变异的信息。
+# VCFtools filtering with different missing thresholds
+for missing in 0.8 0.5; do
+    vcftools --vcf snp.hardfiltered.biallelic.vcf \
+        --maf 0.05 \
+        --max-missing $missing \
+        --recode --recode-INFO-all \
+        --out snp_hardfiltered_biallelic_maf5_ms${missing/./}
+done
 
-awk '$5 !~ /([[:alpha:]]|*)+,([[:alpha:]]|*)/{print}' snp.hardfiltered.vcf > snp.hardfiltered.biallelic.vcf 
+# Process INDELs
+gatk SelectVariants \
+    -V raw_variantsnew_indel.vcf.gz \
+    --O indel.biallelic.vcf \
+    --max-indel-size 9 \
+    --restrict-alleles-to BIALLELIC
 
-用 VCFtools 分别过滤一份完整度80%和50%的vcf
-vcftools --vcf snp.hardfiltered.biallelic.vcf --maf 0.05 --max-missing 0.8 --recode --recode-INFO-all --out snp_hardfiltered_biallelic_maf5_ms80 
+gatk VariantFiltration \
+    -V indel.biallelic.vcf \
+    -O indel.biallelic.10bp.hardfilterannotated.vcf \
+    -filter "QD < 2.0" --filter-name "QD2" \
+    -filter "QUAL < 30.0" --filter-name "QUAL30" \
+    -filter "FS > 200.0" --filter-name "FS200" \
+    -filter "ReadPosRankSum < -20.0" --filter-name "ReadPosRankSum-20"
 
-#####以下是汇总long和bifi的结果
-After filtering, kept 291 out of 291 Individuals
-Outputting VCF file...
-After filtering, kept 24316 out of a possible 116851 Sites
-Run Time = 22.00 seconds
-######
+# PLINK analysis pipeline
+plink --vcf snp_hardfiltered_biallelic_maf5_ms50.recode.vcf \
+    --geno 0.5 \
+    --make-bed \
+    --allow-extra-chr \
+    --out filtered_dataset_g
 
+plink --bfile filtered_dataset_g \
+    --mind 0.5 \
+    --make-bed \
+    --allow-extra-chr \
+    --out filtered_dataset_gm
 
-                                              
-vcftools --vcf snp.hardfiltered.biallelic.vcf --maf 0.05 --max-missing 0.5 --recode --recode-INFO-all --out snp_hardfiltered_biallelic_maf5_ms50
+# Quality control analysis
+plink --bfile filtered_dataset_gm \
+    --maf 0.05 \
+    --make-bed \
+    --allow-extra-chr \
+    --out filtered_dataset_gmm
 
-#####
-After filtering, kept 291 out of 291 Individuals
-Outputting VCF file...
-After filtering, kept 32050 out of a possible 116851 Sites
-Run Time = 25.00 seconds
-########
-
- 
-       
-####处理indel数据，筛选出<10，双等位基因的indel
-
-gatk SelectVariants -V raw_variantsnew_indel.vcf.gz --O indel.biallelic.vcf --max-indel-size 9 --restrict-alleles-to BIALLELIC
-                  
-## indel过滤注释
-gatk VariantFiltration -V indel.biallelic.vcf -O indel.biallelic.10bp.hardfilterannotated.vcf -filter "QD < 2.0" --filter-name "QD2" -filter "QUAL < 30.0" --filter-name "QUAL30" -filter "FS > 200.0" --filter-name "FS200" -filter "ReadPosRankSum < -20.0" --filter-name "ReadPosRankSum-20"
-
-# 提取通过过滤的变异
-awk '/^#/||$7=="PASS"||$7=="ReadPosRankSum-20"' indel.biallelic.10bp.hardfilterannotated.vcf > indel.biallelic.10bp.hardfiltered.vcf 
-# 过滤一份完整度 50% 的SNP
-vcftools --vcf indel.biallelic.10bp.hardfiltered.vcf --maf 0.05 --max-missing 0.5 --recode --recode-INFO-all --out indel.biallelic.10bp.hardfiltered.maf5ms50  
-###########
-After filtering, kept 7569 out of a possible 28803 Sites
-Run Time = 6.00 seconds##这里使用前面生成indel.biallelic.10bp.hardfiltered.maf5ms50  snp_hardfiltered_biallelic_maf5_ms50
-
-# 质控snp变异和bi-allelic SNPs，前面已经使用vctool做了
-bcftools view -m2 -M2 -v snps -o filtered.vcf.gz raw_variantsnew.vcf
-
-#使用 PLINK 从最终数据集中过滤掉次要等位基因频率 <5% 或缺失 >5% 的 SNP，以排除罕见变异，这里只过滤了geno 
-
-#筛选snp 0.5
-plink --vcf snp_hardfiltered_biallelic_maf5_ms50.recode.vcf --geno 0.5 --make-bed --allow-extra-chr --out filtered_dataset_g 
-
-filtered_dataset_g-temporary.fam written.
-32050 variants loaded from .bim file.
-291 people (0 males, 0 females, 291 ambiguous) loaded from .fam.
-Ambiguous sex IDs written to filtered_dataset_g.nosex .
-Using 1 thread (no multithreaded calculations invoked).
-Before main variant filters, 291 founders and 0 nonfounders present.
-Calculating allele frequencies... done.
-Total genotyping rate is 0.883059.
-0 variants removed due to missing genotype data (--geno).
-32050 variants and 291 people pass filters and QC.
-Note: No phenotypes present.
---make-bed to filtered_dataset_g.bed + filtered_dataset_g.bim +
-filtered_dataset_g.fam ... done.
-
-
-#筛选个体 0.5
-plink --bfile filtered_dataset_g --mind 0.5 --make-bed --allow-extra-chr --out filtered_dataset_gm 
-Total genotyping rate in remaining samples is 0.884545.
-32050 variants and 290 people pass filters and QC.
-Note: No phenotypes present.
---make-bed to filtered_dataset_gm.bed + filtered_dataset_gm.bim +
-filtered_dataset_gm.fam ... done
- 
-  
-   
-#这里可以转换为ped格式，容易查看统计
-plink --bfile filtered_dataset_gm --recode --out filtered_dataset_gm --allow-extra-chr
-
-####查看snp个数和样本数
- wc -l filtered_dataset_gm.map filtered_dataset_gm.ped
-     32050 filtered_dataset_gm.map
-     290 filtered_dataset_gm.ped
-   32340 total
-
-
-#maf质控,。0.5 
-
-plink --bfile filtered_dataset_gm --maf 0.05  --make-bed --allow-extra-chr --out filtered_dataset_gmm
-
-Total genotyping rate is 0.884545.
-9 variants removed due to minor allele threshold(s)
-(--maf/--max-maf/--mac/--max-mac).
-32041 variants and 290 people pass filters and QC.
-Note: No phenotypes present.
---make-bed to filtered_dataset_gmm.bed + filtered_dataset_gmm.bim +
-filtered_dataset_gmm.fam ... done.
-##查看结果
-plink --bfile filtered_dataset_gmm --recode --out filtered_dataset_gmm --allow-extra-chr
-
-
-#maf质控,哈温质控--hwe，杂合度，亲缘关系，
-plink --bfile filtered_dataset_gmm --hardy --allow-extra-chr
-plink --bfile filtered_dataset_gmm --het --out R_check --allow-extra-chr
-
-Total genotyping rate is 0.973862.
-5295 variants and 80 people pass filters and QC.
-
-
-
-#maf筛选样,哈温质控--hwe，杂合度，亲缘关系，（细菌的gwas，考虑不加入质控，最后筛选出15779个变量）
-plink --bfile filtered_dataset --maf 0.05 --make-bed --allow-extra-chr --out filtered_dataset_maf
-
-plink --bfile filtered_dataset --maf 0.05 --hwe 1e-4  --make-bed --allow-extra-chr --out filtered_dataset_maf
-
-
-#需要加入协变量，协变量分为两类，因子协变量，如性别，年龄，需要转换为dummy。数字协变量，如PCA，出生重量等。这里由于有三种类型的变量，分别标记，两歧双歧杆菌:1长双歧婴儿亚种2长双歧杆菌长亚种3，保存在cov.txt中，转化为dummy
-#将文件转换为plink可识别
-plink --bfile filtered_dataset_gmm  --recode --out test --allow-extra-chr
-
-#导入性状
-plink --file test --pheno phenotype.txt --recode --out test --allow-extra-chr
-
-#dummy分类，结果保存在plink.cov文件
-plink --file test --covar cov.txt --write-covar --dummy-coding --allow-extra-chr
-
-
-awk '{$1="";$2="";print $0}' plink.cov | sed 's/^[[:space:]]\+g//' | sed '1d' > temp.txt
-
-awk '{print $1,$2}' plink.cov | tail -n +2 > covname.txt
-
-
-paste -d ' ' covname.txt temp.txt > covfl.txt
-
-#计算PCA
+# Population structure analysis
 plink --file test --pca 3 --allow-extra-chr
 
-#结果保存在plink.eigenvec，合并前面的分类和pca变量
-awk '{print $3,$4,$5}' plink.eigenvec >pca.txt
-
-#将文件转换为plink可识别
-
-plink --file test --make-bed --out test2 --allow-extra-chr
-
-#生成G矩阵
+# GEMMA association analysis
 gemma -bfile test2 -gk 2 -p p.txt
-#G矩阵在output文件夹下：result.sXX.txt
-
-
-#gemma关联分析
 gemma -bfile test2 -p p.txt -k output/result.sXX.txt -lm 1 -c pca.txt
-
